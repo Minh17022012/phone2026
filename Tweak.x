@@ -101,9 +101,6 @@ static void tw26_style(UITabBar *bar, BOOL animated) {
     if (!ev) {
         UITabBarAppearance *ap = [UITabBarAppearance new];
         [ap configureWithTransparentBackground];
-        ap.backgroundEffect = nil;
-        ap.shadowColor = [UIColor clearColor];
-        ap.selectionIndicatorImage = [UIImage new];
         tw26_applyItemColors(ap.stackedLayoutAppearance);
         tw26_applyItemColors(ap.inlineLayoutAppearance);
         tw26_applyItemColors(ap.compactInlineLayoutAppearance);
@@ -131,16 +128,8 @@ static void tw26_style(UITabBar *bar, BOOL animated) {
     }
     ev.frame = bounds;
     ev.layer.cornerRadius = bounds.size.height / 2.0;
-    ev.layer.borderWidth = 1.0;
-    ev.layer.borderColor = [[UIColor separatorColor] resolvedColorWithTraitCollection:bar.traitCollection].CGColor;
     bar.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:bounds
                                                       cornerRadius:bounds.size.height / 2.0].CGPath;
-
-    for (UIView *s in bar.subviews) {
-        if (s.tag == kEffectTag || s.tag == kCapsuleTag) continue;
-        if ([NSStringFromClass(s.class) isEqualToString:@"UITabBarButton"]) continue;
-        s.hidden = YES;   // nền / bóng / chỉ báo gốc gây viên thuốc đôi
-    }
 
     UIView *cap = [bar viewWithTag:kCapsuleTag];
     NSMutableArray<UIView *> *btns = [NSMutableArray array];
@@ -151,7 +140,7 @@ static void tw26_style(UITabBar *bar, BOOL animated) {
     }];
     NSUInteger idx = bar.selectedItem ? [bar.items indexOfObject:bar.selectedItem] : NSNotFound;
     if (cap && idx != NSNotFound && idx < btns.count) {
-        CGRect f = CGRectInset(btns[idx].frame, 3, 5);
+        CGRect f = CGRectInset(btns[idx].frame, 4, 6);
         void (^apply)(void) = ^{ cap.frame = f; cap.layer.cornerRadius = f.size.height / 2.0; };
         if (animated && !CGRectIsEmpty(cap.frame))
             [UIView animateWithDuration:0.35 delay:0 usingSpringWithDamping:0.8 initialSpringVelocity:0.3
@@ -207,9 +196,6 @@ static void tw26_style(UITabBar *bar, BOOL animated) {
     CGRect bf = self.tabBar.frame;
     box.frame = CGRectMake(host.bounds.size.width - kSide - kBarH, bf.origin.y, kBarH, kBarH);
     box.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:box.bounds cornerRadius:kBarH / 2.0].CGPath;
-    UIView *sev = box.subviews.firstObject;
-    sev.layer.borderWidth = 1.0;
-    sev.layer.borderColor = [[UIColor separatorColor] resolvedColorWithTraitCollection:host.traitCollection].CGColor;
     [host bringSubviewToFront:box];
 }
 
@@ -296,11 +282,13 @@ static void tw26_findBarButtons(UIView *v, NSMutableArray *out) {
 @property (nonatomic, strong) UIButton *editBtn;
 @property (nonatomic, strong) UISegmentedControl *seg;
 @property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, weak) UIViewController *vc;
 @end
 @implementation TW26State
 @end
 
-static char kStateKey;
+static char kStateKey, kItemStateKey;
+static BOOL gApplying = NO;   // YES khi chính tweak đang đổi nút -> không chặn
 
 static UISegmentedControl *tw26_findSeg(UIView *v) {
     if ([v isKindOfClass:UISegmentedControl.class]) return (UISegmentedControl *)v;
@@ -329,21 +317,38 @@ static UIView *tw26_capsule(CGFloat w, CGFloat h, UIView *content) {
     return c;
 }
 
-static UIMenu *tw26_menu(UISegmentedControl *seg, UIButton *btn) {
+static UIMenu *tw26_menu(TW26State *st, UIButton *btn) {
+    __weak TW26State *ws = st;
+    __weak UIButton *wb = btn;
     NSArray *titles = @[kAllText, kMissedText];
     NSMutableArray *acts = [NSMutableArray array];
     for (NSInteger i = 0; i < 2; i++) {
         UIAction *a = [UIAction actionWithTitle:titles[i] image:nil identifier:nil handler:^(UIAction *x) {
-            if (seg.numberOfSegments > i) {
-                seg.selectedSegmentIndex = i;
-                [seg sendActionsForControlEvents:UIControlEventValueChanged];
+            TW26State *s2 = ws; UIButton *b2 = wb;
+            if (!s2 || !s2.seg) return;
+            if (s2.seg.numberOfSegments > i) {
+                s2.seg.selectedSegmentIndex = i;
+                [s2.seg sendActionsForControlEvents:UIControlEventValueChanged];
             }
-            btn.menu = tw26_menu(seg, btn);
+            if (b2) b2.menu = tw26_menu(s2, b2);
         }];
-        a.state = (seg.selectedSegmentIndex == i) ? UIMenuElementStateOn : UIMenuElementStateOff;
+        a.state = (st.seg.selectedSegmentIndex == i) ? UIMenuElementStateOn : UIMenuElementStateOff;
         [acts addObject:a];
     }
     return [UIMenu menuWithChildren:acts];
+}
+
+static void tw26_ensureFilter(TW26State *st) {
+    if (st.filter || !st.seg) return;
+    UIButton *fb = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIImageSymbolConfiguration *cfg =
+        [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightMedium];
+    [fb setImage:[UIImage systemImageNamed:@"line.3.horizontal.decrease" withConfiguration:cfg]
+        forState:UIControlStateNormal];
+    fb.tintColor = [UIColor labelColor];
+    fb.showsMenuAsPrimaryAction = YES;
+    fb.menu = tw26_menu(st, fb);
+    st.filter = [[UIBarButtonItem alloc] initWithCustomView:tw26_capsule(40, 40, fb)];
 }
 
 static void tw26_applyNav(UIViewController *vc) {
@@ -352,9 +357,14 @@ static void tw26_applyNav(UIViewController *vc) {
     UINavigationItem *ni = vc.navigationItem;
     TW26State *st = objc_getAssociatedObject(vc, &kStateKey);
 
+    BOOL was = gApplying;
+    gApplying = YES;
+
     if (!st) {
         st = [TW26State new];
+        st.vc = vc;
         objc_setAssociatedObject(vc, &kStateKey, st, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        objc_setAssociatedObject(ni, &kItemStateKey, st, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         __weak UIViewController *wvc = vc;
         __weak TW26State *wst = st;
 
@@ -362,7 +372,6 @@ static void tw26_applyNav(UIViewController *vc) {
         st.seg = tv ? tw26_findSeg(tv) : nil;
         st.native = ni.leftBarButtonItem ?: ni.rightBarButtonItem;
 
-        // tiêu đề
         UILabel *tl = [UILabel new];
         tl.text = kTitleText;
         tl.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
@@ -370,42 +379,29 @@ static void tw26_applyNav(UIViewController *vc) {
         [tl sizeToFit];
         st.titleLabel = tl;
 
-        // nút Sửa
         UIButton *eb = [UIButton buttonWithType:UIButtonTypeSystem];
         [eb setTitle:kEditText forState:UIControlStateNormal];
         eb.titleLabel.font = [UIFont systemFontOfSize:17 weight:UIFontWeightMedium];
         [eb setTitleColor:[UIColor labelColor] forState:UIControlStateNormal];
         [eb addAction:[UIAction actionWithHandler:^(UIAction *a) {
             UIViewController *v = wvc; TW26State *s2 = wst;
-            if (!v) return;
+            if (!v || !s2) return;
             UIBarButtonItem *n = s2.native;
             if (n && n.action) [[UIApplication sharedApplication] sendAction:n.action to:n.target from:n forEvent:nil];
             else [v setEditing:!v.isEditing animated:YES];
         }] forControlEvents:UIControlEventTouchUpInside];
         st.editBtn = eb;
         st.edit = [[UIBarButtonItem alloc] initWithCustomView:tw26_capsule(68, 40, eb)];
-
-        // nút lọc (≡) -> menu Tất cả / Nhỡ
-        if (st.seg) {
-            UIButton *fb = [UIButton buttonWithType:UIButtonTypeSystem];
-            UIImageSymbolConfiguration *cfg =
-                [UIImageSymbolConfiguration configurationWithPointSize:18 weight:UIImageSymbolWeightMedium];
-            [fb setImage:[UIImage systemImageNamed:@"line.3.horizontal.decrease" withConfiguration:cfg]
-                forState:UIControlStateNormal];
-            fb.tintColor = [UIColor labelColor];
-            fb.showsMenuAsPrimaryAction = YES;
-            fb.menu = tw26_menu(st.seg, fb);
-            st.filter = [[UIBarButtonItem alloc] initWithCustomView:tw26_capsule(40, 40, fb)];
-        }
     }
 
-    // luôn giữ titleView là tiêu đề của mình (ghi nhớ segmented mới nếu app đặt lại)
-    UIView *tv = ni.titleView;
-    if (tv != st.titleLabel) {
+    // tiêu đề: luôn là "Cuộc gọi"; nhớ lại thanh All/Missed gốc để điều khiển bằng menu
+    if (ni.titleView != st.titleLabel) {
+        UIView *tv = ni.titleView;
         UISegmentedControl *sg = tv ? tw26_findSeg(tv) : nil;
         if (sg) st.seg = sg;
         ni.titleView = st.titleLabel;
     }
+    tw26_ensureFilter(st);
 
     if (vc.isEditing) {
         [st.editBtn setTitle:kDoneText forState:UIControlStateNormal];
@@ -413,11 +409,48 @@ static void tw26_applyNav(UIViewController *vc) {
         if (ni.rightBarButtonItem != st.edit) [ni setRightBarButtonItem:st.edit animated:NO];
     } else {
         [st.editBtn setTitle:kEditText forState:UIControlStateNormal];
-        if (ni.rightBarButtonItem == st.edit || ni.rightBarButtonItem != st.filter)
-            [ni setRightBarButtonItem:st.filter animated:NO];
+        if (ni.rightBarButtonItem != st.filter) [ni setRightBarButtonItem:st.filter animated:NO];
         if (ni.leftBarButtonItem != st.edit) [ni setLeftBarButtonItem:st.edit animated:NO];
     }
+    gApplying = was;
 }
+
+// App gốc hay đặt lại nút "Edit" ở bên phải sau khi tweak đã đổi -> chặn lại, ghi nhớ nút gốc, áp dụng lại bố cục của tweak
+static BOOL tw26_swallow(UINavigationItem *ni, NSArray *items, BOOL right) {
+    if (gApplying) return NO;
+    TW26State *st = objc_getAssociatedObject(ni, &kItemStateKey);
+    UIViewController *vc = st.vc;
+    if (!st || !vc) return NO;
+    UIBarButtonItem *first = items.firstObject;
+    if (first && (first == st.edit || first == st.filter)) return NO;
+    if (!right && vc.isEditing) return NO;       // để nút "Xóa/Clear" của chế độ sửa đi qua
+    if (first) st.native = first;
+    tw26_applyNav(vc);
+    return YES;
+}
+
+%hook UINavigationItem
+- (void)setRightBarButtonItems:(NSArray *)items animated:(BOOL)a { if (tw26_swallow(self, items, YES)) return; %orig; }
+- (void)setRightBarButtonItems:(NSArray *)items                  { if (tw26_swallow(self, items, YES)) return; %orig; }
+- (void)setRightBarButtonItem:(UIBarButtonItem *)i animated:(BOOL)a { if (tw26_swallow(self, i ? @[i] : @[], YES)) return; %orig; }
+- (void)setRightBarButtonItem:(UIBarButtonItem *)i                  { if (tw26_swallow(self, i ? @[i] : @[], YES)) return; %orig; }
+- (void)setLeftBarButtonItems:(NSArray *)items animated:(BOOL)a  { if (tw26_swallow(self, items, NO)) return; %orig; }
+- (void)setLeftBarButtonItems:(NSArray *)items                   { if (tw26_swallow(self, items, NO)) return; %orig; }
+- (void)setLeftBarButtonItem:(UIBarButtonItem *)i animated:(BOOL)a { if (tw26_swallow(self, i ? @[i] : @[], NO)) return; %orig; }
+- (void)setLeftBarButtonItem:(UIBarButtonItem *)i                  { if (tw26_swallow(self, i ? @[i] : @[], NO)) return; %orig; }
+- (void)setTitleView:(UIView *)v {
+    if (!gApplying) {
+        TW26State *st = objc_getAssociatedObject(self, &kItemStateKey);
+        if (st && st.vc && v != st.titleLabel) {
+            UISegmentedControl *sg = v ? tw26_findSeg(v) : nil;
+            if (sg) { st.seg = sg; tw26_ensureFilter(st); }
+            tw26_applyNav(st.vc);
+            return;
+        }
+    }
+    %orig;
+}
+%end
 
 %hook UIViewController
 - (void)viewWillAppear:(BOOL)animated { %orig; tw26_applyNav(self); }
@@ -566,10 +599,14 @@ static void tw26_cell(UITableViewCell *cell) {
 
     // --- phân vai & đặt font
     UILabel *sub = nil, *timeL = nil; CGRect sr = CGRectZero;
+    NSMutableArray<UILabel *> *sameRow = [NSMutableArray array];
     for (UILabel *l in ls) {
         if (l.hidden || l.text.length == 0 || l == name) continue;
         CGRect r = [l convertRect:l.bounds toView:cell];
         if (CGRectGetMidX(r) > W * 0.5) { if (!timeL) timeL = l; }
+        else if (name && fabs(CGRectGetMidY(r) - CGRectGetMidY(nr)) < nr.size.height * 0.5 && r.origin.x > nr.origin.x) {
+            [sameRow addObject:l];            // nhãn đếm "(4)" cùng hàng với tên
+        }
         else if (!sub || r.origin.y < sr.origin.y) { sub = l; sr = r; }
     }
     UIFont *nf = [UIFont systemFontOfSize:kNameSize weight:UIFontWeightSemibold];
@@ -584,6 +621,11 @@ static void tw26_cell(UITableViewCell *cell) {
     CGFloat total = nh + (sub ? gap + sh : 0);
     CGFloat y0 = (H - total) / 2.0;
     if (name) tw26_setY(name, cell, y0, nh);
+    for (UILabel *l in sameRow) {
+        UIFont *cf2 = [UIFont systemFontOfSize:kNameSize weight:UIFontWeightRegular];
+        if (![l.font isEqual:cf2]) l.font = cf2;
+        tw26_setY(l, cell, y0, nh);
+    }
     if (sub)  tw26_setY(sub, cell, y0 + nh + gap, sh);
     if (timeL) tw26_setY(timeL, cell, (H - th) / 2.0, th);
 
