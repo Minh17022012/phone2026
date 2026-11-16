@@ -9,8 +9,12 @@
 // YES: bấm nút tròn bên phải = gọi lại (giống bấm dòng).  NO: bấm nút = mở chi tiết cuộc gọi (nút "i" cũ)
 static const BOOL kButtonCalls = YES;
 
+// Cỡ chữ dòng cuộc gọi (chỉnh nhỏ/lớn tại đây)
+static const CGFloat kNameSize = 15.5, kSubSize = 12.5, kTimeSize = 13.5;
+
 static const CGFloat kBarH = 64.0, kSide = 18.0, kGap = 10.0;   // tab bar
-static const CGFloat kRowH = 82.0, kAvD = 50.0, kBtnD = 56.0, kRowSide = 16.0; // dòng cuộc gọi
+static const CGFloat kRowH = 76.0, kAvD = 50.0, kBtnD = 54.0, kRowSide = 16.0;
+static const CGFloat kAvGap = 10.0;   // khoảng cách avatar -> tên (nhỏ hơn = gần hơn) // dòng cuộc gọi
 static const NSInteger kSearchTag = 26001, kEffectTag = 26002, kCapsuleTag = 26003;
 static const NSInteger kAvTag = 26010, kAvLetterTag = 26011, kAvIconTag = 26012, kCallTag = 26013, kNavTag = 26020;
 static char kRowKey;
@@ -89,6 +93,9 @@ static void tw26_style(UITabBar *bar, BOOL animated) {
     if (!ev) {
         UITabBarAppearance *ap = [UITabBarAppearance new];
         [ap configureWithTransparentBackground];
+        ap.backgroundEffect = nil;
+        ap.shadowColor = [UIColor clearColor];
+        ap.selectionIndicatorImage = [UIImage new];
         tw26_applyItemColors(ap.stackedLayoutAppearance);
         tw26_applyItemColors(ap.inlineLayoutAppearance);
         tw26_applyItemColors(ap.compactInlineLayoutAppearance);
@@ -118,6 +125,12 @@ static void tw26_style(UITabBar *bar, BOOL animated) {
     ev.layer.cornerRadius = bounds.size.height / 2.0;
     bar.layer.shadowPath = [UIBezierPath bezierPathWithRoundedRect:bounds
                                                       cornerRadius:bounds.size.height / 2.0].CGPath;
+
+    for (UIView *s in bar.subviews) {
+        if (s.tag == kEffectTag || s.tag == kCapsuleTag) continue;
+        if ([NSStringFromClass(s.class) isEqualToString:@"UITabBarButton"]) continue;
+        s.hidden = YES;   // nền / bóng / chỉ báo gốc gây viên thuốc đôi
+    }
 
     UIView *cap = [bar viewWithTag:kCapsuleTag];
     NSMutableArray<UIView *> *btns = [NSMutableArray array];
@@ -227,12 +240,23 @@ static void tw26_findBarButtons(UIView *v, NSMutableArray *out) {
 
     NSMutableArray<UIView *> *btns = [NSMutableArray array];
     tw26_findBarButtons(self, btns);
+    CGFloat barW = self.bounds.size.width;
     for (UIView *b in btns) {
         CGFloat bw = b.bounds.size.width, bh = b.bounds.size.height;
-        if (bw < 1) continue;
+        if (bw < 1 || bh < 1) continue;
         NSMutableArray *ls = [NSMutableArray array];
         tw26_collectLabels(b, ls);
-        CGFloat h = 44.0, w = ls.count ? MAX(68.0, bw + 24.0) : 44.0;
+        BOOL hasText = NO;
+        for (UILabel *l in ls) if (!l.hidden && l.text.length) { hasText = YES; break; }
+        CGFloat h = 40.0;
+        CGFloat w = hasText ? MAX(64.0, bw + 8.0) : 40.0;
+        CGRect f = CGRectMake((bw - w) / 2.0, (bh - h) / 2.0, w, h);
+        // không để viên thuốc tràn ra ngoài màn hình
+        CGRect inBar = [b convertRect:f toView:self];
+        CGFloat dx = 0;
+        if (CGRectGetMaxX(inBar) > barW - 10) dx = (barW - 10) - CGRectGetMaxX(inBar);
+        if (inBar.origin.x + dx < 10) dx = 10 - inBar.origin.x;
+        f.origin.x += dx;
         b.clipsToBounds = NO;
         UIVisualEffectView *ev = (UIVisualEffectView *)[b viewWithTag:kNavTag];
         if (!ev) {
@@ -244,7 +268,7 @@ static void tw26_findBarButtons(UIView *v, NSMutableArray *out) {
             ev.layer.cornerCurve = kCACornerCurveContinuous;
             [b insertSubview:ev atIndex:0];
         }
-        ev.frame = CGRectMake((bw - w) / 2.0, (bh - h) / 2.0, w, h);
+        ev.frame = f;
         ev.layer.cornerRadius = h / 2.0;
     }
 }
@@ -258,19 +282,34 @@ static BOOL tw26_isRecentsCell(UITableViewCell *c) {
            [n rangeOfString:@"RecentCall" options:NSCaseInsensitiveSearch].location != NSNotFound;
 }
 
+static void tw26_setY(UIView *v, UIView *cell, CGFloat yCell, CGFloat h) {
+    CGPoint p = [cell convertPoint:CGPointMake(0, yCell) toView:v.superview];
+    CGRect f = v.frame; f.origin.y = p.y; f.size.height = h; v.frame = f;
+}
+
+static UIImageView *tw26_findIcon(UIView *v) {
+    for (UIView *s in v.subviews) {
+        if ([s isKindOfClass:UIImageView.class]) {
+            UIImageView *iv = (UIImageView *)s;
+            if (!iv.hidden && iv.image && iv.bounds.size.width <= 34 && iv.bounds.size.height <= 34) return iv;
+        }
+        UIImageView *r = tw26_findIcon(s);
+        if (r) return r;
+    }
+    return nil;
+}
+
 static void tw26_cell(UITableViewCell *cell) {
     UITableView *tv = tw26_tableOf(cell);
     CGFloat W = cell.bounds.size.width, H = cell.bounds.size.height;
     if (W < 1 || H < 1) return;
 
-    // Chiều cao dòng
     if (tv && !objc_getAssociatedObject(tv, &kRowKey)) {
         objc_setAssociatedObject(tv, &kRowKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         tv.rowHeight = kRowH;
         dispatch_async(dispatch_get_main_queue(), ^{ [tv beginUpdates]; [tv endUpdates]; });
     }
 
-    // Bỏ nút "i" gốc
     if (cell.accessoryType != UITableViewCellAccessoryNone) cell.accessoryType = UITableViewCellAccessoryNone;
     if (cell.accessoryView) cell.accessoryView = nil;
     for (UIView *s in cell.contentView.subviews)
@@ -294,7 +333,7 @@ static void tw26_cell(UITableViewCell *cell) {
         l.tag = kAvLetterTag;
         l.textAlignment = NSTextAlignmentCenter;
         l.textColor = [UIColor whiteColor];
-        l.font = [UIFont systemFontOfSize:24 weight:UIFontWeightSemibold];
+        l.font = [UIFont systemFontOfSize:22 weight:UIFontWeightSemibold];
         [av addSubview:l];
         UIImageView *iv = [[UIImageView alloc] initWithFrame:CGRectMake(12, 12, kAvD - 24, kAvD - 24)];
         iv.tag = kAvIconTag;
@@ -319,15 +358,13 @@ static void tw26_cell(UITableViewCell *cell) {
     cb.hidden = editing;
     if (editing) return;
 
-    CGFloat left = kRowSide + kAvD + 12.0, right = kRowSide + kBtnD + 6.0;
-    CGRect cf = CGRectMake(left, 0, W - left - right, H);
-    if (!CGRectEqualToRect(cell.contentView.frame, cf)) cell.contentView.frame = cf;
-    cell.separatorInset = UIEdgeInsetsMake(0, left, 0, kRowSide);
+    CGFloat left = kRowSide + kAvD + kAvGap, right = kRowSide + kBtnD + 6.0;
     av.frame = CGRectMake(kRowSide, (H - kAvD) / 2.0, kAvD, kAvD);
     cb.frame = CGRectMake(W - kRowSide - kBtnD, (H - kBtnD) / 2.0, kBtnD, kBtnD);
     [cell bringSubviewToFront:cb];
+    cell.separatorInset = UIEdgeInsetsMake(0, left, 0, kRowSide);
 
-    // Tìm label tên (trái nhất, trên cùng) & phát hiện cuộc gọi video
+    // --- tìm label: tên (trái nhất, trên cùng)
     NSMutableArray *ls = [NSMutableArray array];
     tw26_collectLabels(cell.contentView, ls);
     UILabel *name = nil; CGRect nr = CGRectZero; BOOL video = NO;
@@ -339,10 +376,52 @@ static void tw26_cell(UITableViewCell *cell) {
             name = l; nr = r;
         }
     }
+
+    // --- dời contentView để tên nằm sát avatar (bù khoảng trống dành cho icon gốc)
+    CGFloat off = name ? [name convertRect:name.bounds toView:cell.contentView].origin.x : 47.0;
+    CGFloat cx = left - off;
+    CGRect cf = CGRectMake(cx, 0, W - cx - right, H);
+    if (!CGRectEqualToRect(cell.contentView.frame, cf)) {
+        cell.contentView.frame = cf;
+        [cell.contentView layoutIfNeeded];
+    }
+
+    // --- phân vai & đặt font
+    UILabel *sub = nil, *timeL = nil; CGRect sr = CGRectZero;
+    for (UILabel *l in ls) {
+        if (l.hidden || l.text.length == 0 || l == name) continue;
+        CGRect r = [l convertRect:l.bounds toView:cell];
+        if (CGRectGetMidX(r) > W * 0.5) { if (!timeL) timeL = l; }
+        else if (!sub || r.origin.y < sr.origin.y) { sub = l; sr = r; }
+    }
+    UIFont *nf = [UIFont systemFontOfSize:kNameSize weight:UIFontWeightSemibold];
+    UIFont *sf = [UIFont systemFontOfSize:kSubSize weight:UIFontWeightRegular];
+    UIFont *tf = [UIFont systemFontOfSize:kTimeSize weight:UIFontWeightRegular];
+    if (name && ![name.font isEqual:nf]) name.font = nf;
+    if (sub && ![sub.font isEqual:sf]) sub.font = sf;
+    if (timeL && ![timeL.font isEqual:tf]) timeL.font = tf;
+
+    // --- căn giữa dọc khối (tên + dòng phụ) và giờ
+    CGFloat nh = ceil(nf.lineHeight), sh = ceil(sf.lineHeight), th = ceil(tf.lineHeight), gap = 2.0;
+    CGFloat total = nh + (sub ? gap + sh : 0);
+    CGFloat y0 = (H - total) / 2.0;
+    if (name) tw26_setY(name, cell, y0, nh);
+    if (sub)  tw26_setY(sub, cell, y0 + nh + gap, sh);
+    if (timeL) tw26_setY(timeL, cell, (H - th) / 2.0, th);
+
+    // --- icon hướng cuộc gọi: đặt ngay trước dòng phụ
+    UIImageView *icon = tw26_findIcon(cell.contentView);
+    if (sub && icon) {
+        CGFloat iw = icon.bounds.size.width;
+        CGRect cur = [sub convertRect:sub.bounds toView:cell];
+        CGFloat dx = (left + iw + 4.0) - cur.origin.x;
+        CGRect f = sub.frame; f.origin.x += dx; f.size.width -= dx; sub.frame = f;
+        CGPoint c = [cell convertPoint:CGPointMake(left + iw / 2.0, y0 + nh + gap + sh / 2.0) toView:icon.superview];
+        icon.center = c;
+    }
+
+    // --- avatar chữ cái
     if (name) {
-        UIFont *f = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
-        if (fabs(name.font.pointSize - 18) > 0.1 || name.font.fontDescriptor.symbolicTraits != f.fontDescriptor.symbolicTraits)
-            name.font = f;
         NSString *t = name.text;
         NSString *ch = @"";
         if (t.length) ch = [[t substringWithRange:[t rangeOfComposedCharacterSequenceAtIndex:0]] uppercaseString];
@@ -354,12 +433,12 @@ static void tw26_cell(UITableViewCell *cell) {
         ai.hidden = isLetter;
     }
 
-    // Icon điện thoại / video
+    // --- icon nút gọi / video
     NSString *kind = video ? @"video" : @"phone";
     if (![cb.accessibilityIdentifier isEqualToString:kind]) {
         cb.accessibilityIdentifier = kind;
         UIImageSymbolConfiguration *cfg =
-            [UIImageSymbolConfiguration configurationWithPointSize:22 weight:UIImageSymbolWeightMedium];
+            [UIImageSymbolConfiguration configurationWithPointSize:21 weight:UIImageSymbolWeightMedium];
         [cb setImage:[UIImage systemImageNamed:(video ? @"video.fill" : @"phone.fill") withConfiguration:cfg]
             forState:UIControlStateNormal];
     }
