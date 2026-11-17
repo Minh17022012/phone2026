@@ -164,10 +164,10 @@ static void tw26_setAvatar(UIView *av, NSString *name, NSInteger maxLetters) {
 #pragma mark - Tab bar
 
 static CGRect tw26_barFrame(UITabBar *bar, CGRect orig) {
-    if (tw26_classic()) return orig;   // Cổ điển: giữ thanh tab mặc định
     UIView *sv = bar.superview;
     if (!sv || sv.bounds.size.width < 1) return orig;
     CGRect b = sv.bounds;
+    if (tw26_classic()) return orig;   // Cổ điển: không chỉnh gì ở thanh tab
     CGFloat margin = sv.safeAreaInsets.bottom > 0 ? 18.0 : 12.0;
     CGFloat w = b.size.width - 2 * kSide - (tw26_classic() ? 0.0 : kGap + kBarH);
     return CGRectMake(kSide, b.size.height - margin - kBarH, w, kBarH);
@@ -414,6 +414,8 @@ static BOOL gApplying = NO;   // YES khi chính tweak đang đổi nút -> khôn
 static void tw26_applyNav(UIViewController *vc);
 static void tw26_applyMode(UIViewController *vc);
 static void tw26_showMenu(UIView *anchor, UIViewController *vc, TW26State *st);
+static BOOL tw26_isDetailVC(UIViewController *vc);
+static void tw26_styleDetailRoot(UIViewController *root);
 
 static UISegmentedControl *tw26_findSeg(UIView *v) {
     if ([v isKindOfClass:UISegmentedControl.class]) return (UISegmentedControl *)v;
@@ -871,6 +873,10 @@ static void tw26_applyGeneric(UIViewController *vc) {
 - (void)viewWillAppear:(BOOL)animated { %orig; tw26_applyNav(self); tw26_applyGeneric(self); }
 - (void)viewDidAppear:(BOOL)animated  { %orig; tw26_applyNav(self); }
 - (void)setEditing:(BOOL)editing animated:(BOOL)animated { %orig; tw26_applyNav(self); }
+- (void)viewDidLayoutSubviews {
+    %orig;
+    if (tw26_isDetailVC(self) && !tw26_isDetailVC(self.parentViewController)) tw26_styleDetailRoot(self);
+}
 %end
 
 #pragma mark - Dòng cuộc gọi (avatar + giờ + nút gọi tròn)
@@ -1128,59 +1134,127 @@ static BOOL tw26_isDetailVC(UIViewController *vc) {
     return strstr(n, "CNContact") && !strstr(n, "List") && !strstr(n, "Picker") && !strstr(n, "Group");
 }
 
-static char kSegKey, kThrottleKey, kPendingKey;
+static char kSegKey, kThrottleKey, kPendingKey, kSegHdrKey;
+static const NSInteger kDetailSegTag = 26050;
 
-static void tw26_collectControls(UIView *v, NSMutableArray *out) {
-    for (UIView *s2 in v.subviews) {
-        if ([s2 isKindOfClass:UIControl.class] && ![s2 isKindOfClass:UISegmentedControl.class]) [out addObject:s2];
-        else tw26_collectControls(s2, out);
-    }
-}
-
-// Nút hành động (nhắn tin / gọi / video / mail) -> viên tròn mờ, chỉ còn icon
-static void tw26_styleDetailHeader(UITableView *tv) {
-    UIView *h = tv.tableHeaderView;
-    if (!h) return;
-    NSMutableArray *hl = [NSMutableArray array];
-    tw26_collectLabels(h, hl);
-    NSMutableArray *cs = [NSMutableArray array];
-    tw26_collectControls(h, cs);
-    for (UIControl *c in cs) {
-        CGSize z = c.bounds.size;
-        if (z.width < 50 || z.width > 140 || z.height < 40 || z.height > 100) continue;
-        const char *cn = class_getName(object_getClass(c));
-        if (!strcasestr(cn, "Action") && !strcasestr(cn, "Button")) continue;
-        tw26_setBg(c, tw26_pillBg());
-        if (fabs(c.layer.cornerRadius - z.height / 2.0) > 0.5) c.layer.cornerRadius = z.height / 2.0;
-        if (!c.clipsToBounds) c.clipsToBounds = YES;
-        NSMutableArray *ls = [NSMutableArray array];
-        tw26_collectLabels(c, ls);
-        for (UILabel *l in ls) { if (!l.hidden) l.hidden = YES; [hl removeObject:l]; }
-    }
-    for (UILabel *l in hl) tw26_setTxt(l, [UIColor whiteColor]);
-}
-
-static void tw26_styleDetailTable(UITableView *tv) {
+// chạy tối đa ~3 lần/giây cho mỗi đối tượng, luôn có một lần chạy cuối -> không bao giờ gây vòng lặp layout
+static void tw26_throttle(id obj, void (^work)(void)) {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
-    NSNumber *last = objc_getAssociatedObject(tv, &kThrottleKey);
+    NSNumber *last = objc_getAssociatedObject(obj, &kThrottleKey);
     if (last && now - last.doubleValue < 0.3) {
-        if (![objc_getAssociatedObject(tv, &kPendingKey) boolValue]) {     // đảm bảo có một lần áp dụng cuối
-            objc_setAssociatedObject(tv, &kPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            __weak UITableView *wtv = tv;
+        if (![objc_getAssociatedObject(obj, &kPendingKey) boolValue]) {
+            objc_setAssociatedObject(obj, &kPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                UITableView *t2 = wtv;
-                if (!t2) return;
-                objc_setAssociatedObject(t2, &kPendingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                tw26_styleDetailTable(t2);
+                objc_setAssociatedObject(obj, &kPendingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                tw26_throttle(obj, work);
             });
         }
         return;
     }
-    objc_setAssociatedObject(tv, &kThrottleKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    tw26_setBg(tv, tw26_detailBg());
-    if (tv.superview) tw26_setBg(tv.superview, tw26_detailBg());
-    if (![tv.separatorColor isEqual:tw26_detailSep()]) tv.separatorColor = tw26_detailSep();
-    tw26_styleDetailHeader(tv);
+    objc_setAssociatedObject(obj, &kThrottleKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    work();
+}
+
+// nút hành động (nhắn tin / gọi / video / mail) -> viên bo tròn mờ, chỉ còn icon
+static void tw26_pillifyControl(UIControl *c) {
+    CGSize z = c.bounds.size;
+    if (z.width < 50 || z.width > 150 || z.height < 40 || z.height > 110) return;
+    tw26_setBg(c, tw26_pillBg());
+    if (fabs(c.layer.cornerRadius - z.height / 2.0) > 0.5) c.layer.cornerRadius = z.height / 2.0;
+    if (!c.clipsToBounds) c.clipsToBounds = YES;
+    NSMutableArray *ls = [NSMutableArray array];
+    tw26_collectLabels(c, ls);
+    for (UILabel *l in ls) if (!l.hidden) l.hidden = YES;
+}
+
+// duyệt phần đầu trang (avatar, tên, nút) nằm NGOÀI bảng
+static void tw26_walkDetail(UIView *v, UIView *skip, CGFloat baseW, NSMutableArray *labels,
+                            NSMutableArray *controls, NSMutableArray *containers, UIView **avatar) {
+    for (UIView *s2 in v.subviews) {
+        if (s2 == skip) continue;
+        const char *cn = class_getName(object_getClass(s2));
+        if (strstr(cn, "Avatar") && s2.bounds.size.width >= 60) { if (!*avatar) *avatar = s2; continue; }
+        if ([s2 isKindOfClass:UILabel.class]) { [labels addObject:s2]; continue; }
+        if ([s2 isKindOfClass:UISegmentedControl.class]) continue;
+        if ([s2 isKindOfClass:UIControl.class]) { [controls addObject:s2]; continue; }
+        if (![s2 isKindOfClass:UIImageView.class] && s2.bounds.size.width >= baseW * 0.9) [containers addObject:s2];
+        tw26_walkDetail(s2, skip, baseW, labels, controls, containers, avatar);
+    }
+}
+
+static UIView *tw26_makeDetailSegHeader(CGFloat w, UIViewController *root) {
+    UIView *h = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 56)];
+    h.tag = kDetailSegTag;
+    h.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+    UISegmentedControl *sc = [[UISegmentedControl alloc] initWithItems:@[@"Chi tiết", @"Thư thoại"]];
+    sc.selectedSegmentIndex = 0;
+    sc.frame = CGRectMake((w - 210) / 2.0, 11, 210, 34);
+    sc.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
+    __weak UIViewController *wr = root;
+    [sc addAction:[UIAction actionWithHandler:^(UIAction *a) {
+        UISegmentedControl *s2 = (UISegmentedControl *)a.sender;
+        if (s2.selectedSegmentIndex != 1) return;
+        UIViewController *v = wr;
+        UITabBarController *tbc = v.tabBarController;
+        NSArray *all = tbc ? objc_getAssociatedObject(tbc, &kAllKey) : nil;
+        for (UIViewController *c in all) {
+            if ([tw26_name(c) containsString:@"voicemail"] && [tbc.viewControllers containsObject:c]) {
+                [v.navigationController popToRootViewControllerAnimated:NO];
+                tbc.selectedViewController = c;
+                break;
+            }
+        }
+        s2.selectedSegmentIndex = 0;
+    }] forControlEvents:UIControlEventValueChanged];
+    [h addSubview:sc];
+    return h;
+}
+
+static void tw26_styleDetailRoot(UIViewController *root) {
+    UIView *base = root.view;
+    if (!base || base.bounds.size.width < 1) return;
+    tw26_throttle(root, ^{
+        tw26_setBg(base, tw26_detailBg());
+        UITableView *tv = tw26_findTable(base);
+        NSMutableArray *labels = [NSMutableArray array], *controls = [NSMutableArray array], *containers = [NSMutableArray array];
+        UIView *avatar = nil;
+        tw26_walkDetail(base, tv, base.bounds.size.width, labels, controls, containers, &avatar);
+        for (UIView *c in containers) {
+            if ([c isKindOfClass:UIVisualEffectView.class]) { if (c.alpha != 0) c.alpha = 0; }
+            else if (c.backgroundColor) tw26_setBg(c, tw26_detailBg());
+        }
+        for (UILabel *l in labels) if (!l.hidden) tw26_setTxt(l, [UIColor whiteColor]);
+        for (UIControl *c in controls) tw26_pillifyControl(c);
+        if (avatar) {                                   // avatar to hơn, nằm giữa
+            CGAffineTransform t = CGAffineTransformMakeScale(1.3, 1.3);
+            if (!CGAffineTransformEqualToTransform(avatar.transform, t)) avatar.transform = t;
+        }
+        // thanh "Chi tiết | Thư thoại" nhỏ dưới các nút (chỉ khi mở từ Gần đây và bảng chưa có tiêu đề)
+        UITabBarController *tbc = root.tabBarController;
+        BOOL fromRecents = tbc && [tw26_name(tbc.selectedViewController) containsString:@"recent"];
+        if (tv && fromRecents && !tv.tableHeaderView &&
+            ![objc_getAssociatedObject(tv, &kSegHdrKey) boolValue]) {
+            objc_setAssociatedObject(tv, &kSegHdrKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            __weak UIViewController *wroot = root;
+            dispatch_async(dispatch_get_main_queue(), ^{
+                UIViewController *r2 = wroot;
+                if (r2 && !tv.tableHeaderView) tv.tableHeaderView = tw26_makeDetailSegHeader(tv.bounds.size.width, r2);
+            });
+        }
+    });
+}
+
+static void tw26_styleDetailTable(UITableView *tv) {
+    tw26_throttle(tv, ^{
+        tw26_setBg(tv, tw26_detailBg());
+        if (tv.superview) tw26_setBg(tv.superview, tw26_detailBg());
+        if (![tv.separatorColor isEqual:tw26_detailSep()]) tv.separatorColor = tw26_detailSep();
+        if (tv.tableHeaderView) {
+            NSMutableArray *hl = [NSMutableArray array];
+            tw26_collectLabels(tv.tableHeaderView, hl);
+            for (UILabel *l in hl) tw26_setTxt(l, [UIColor whiteColor]);
+        }
+    });
 }
 
 static void tw26_detailCell(UITableViewCell *cell, UITableView *tv) {
@@ -1189,7 +1263,28 @@ static void tw26_detailCell(UITableViewCell *cell, UITableView *tv) {
     NSMutableArray *ls = [NSMutableArray array];
     tw26_collectLabels(cell.contentView, ls);
     for (UILabel *l in ls) tw26_setTxt(l, l.font.pointSize >= 16.5 ? tw26_txtBig() : tw26_txtSmall());
+
+    // mỗi nhóm dòng = một thẻ bo tròn lớn (góc trên cho dòng đầu, góc dưới cho dòng cuối)
+    NSIndexPath *ip = [tv indexPathForCell:cell];
+    if (ip) {
+        NSInteger n = [tv numberOfRowsInSection:ip.section];
+        CACornerMask m = 0;
+        if (ip.row == 0) m |= kCALayerMinXMinYCorner | kCALayerMaxXMinYCorner;
+        if (ip.row == n - 1) m |= kCALayerMinXMaxYCorner | kCALayerMaxXMaxYCorner;
+        if (fabs(cell.layer.cornerRadius - 24.0) > 0.5) cell.layer.cornerRadius = 24.0;
+        if (cell.layer.maskedCorners != m) cell.layer.maskedCorners = m;
+        if (!cell.clipsToBounds) cell.clipsToBounds = YES;
+    }
     tw26_styleDetailTable(tv);
+}
+
+static BOOL tw26_inContactsTab(UIViewController *vc) {
+    UITabBarController *tbc = vc.tabBarController;
+    NSArray *all = tbc ? objc_getAssociatedObject(tbc, &kAllKey) : nil;
+    if (all.count < 5) return NO;                  // thứ tự tab của app Điện thoại: Yêu thích, Gần đây, Danh bạ, ...
+    UIViewController *target = all[2];
+    for (UIViewController *v = vc; v; v = v.parentViewController) if (v == target) return YES;
+    return NO;
 }
 
 // Phân loại bảng theo màn hình chứa nó: 1 = chi tiết liên hệ, 3 = danh sách danh bạ, 2 = khác
@@ -1202,8 +1297,10 @@ static void tw26_otherCell(UITableViewCell *cell) {
         if (!vc) return;                       // chưa gắn vào màn hình -> thử lại lần sau
         const char *n = class_getName(object_getClass(vc));
         int kind = 2;
-        if (tw26_isDetailVC(vc)) kind = 1;
-        else if (strstr(n, "Contact") && !strstr(n, "Picker") && !strstr(n, "Group")) kind = 3;
+        if (tw26_isDetailVC(vc) || tw26_isDetailVC(vc.parentViewController)) kind = 1;
+        else if ((strstr(n, "Contact") && !strstr(n, "Picker") && !strstr(n, "Group")) ||
+                 (tw26_inContactsTab(vc) && [tv.dataSource respondsToSelector:@selector(sectionIndexTitlesForTableView:)]))
+            kind = 3;
         k = @(kind);
         objc_setAssociatedObject(tv, &kDetailKey, k, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
@@ -1254,90 +1351,6 @@ static void tw26_otherCell(UITableViewCell *cell) {
             [(UIButton *)s sendActionsForControlEvents:UIControlEventTouchUpInside];
             return;
         }
-    }
-}
-%end
-
-#pragma mark - Bàn phím số kiểu iOS 26 (nút tròn trắng + bóng mềm)
-
-static int tw26_kind(Class c) {
-    static CFMutableDictionaryRef cache;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ cache = CFDictionaryCreateMutable(NULL, 0, NULL, NULL); });
-    const void *v = CFDictionaryGetValue(cache, (__bridge const void *)c);
-    if (v) return (int)((intptr_t)v) - 1;
-    const char *n = class_getName(c);
-    int k = (strstr(n, "NumberPad") && strstr(n, "Button")) ? 1 : 0;
-    CFDictionarySetValue(cache, (__bridge const void *)c, (const void *)(intptr_t)(k + 1));
-    return k;
-}
-
-static const BOOL kStyleKeypad = YES;      // NO = trả bàn phím về mặc định của iPhone
-static const CGFloat kKeyD = 78.0;           // đường kính vòng tròn phím
-static const NSInteger kKeyCircleTag = 26040;
-
-static UIColor *tw26_keyFill(BOOL pressed) {
-    static UIColor *n, *p; static dispatch_once_t o;
-    dispatch_once(&o, ^{
-        n = tw26_dyn([UIColor colorWithWhite:0.985 alpha:1], [UIColor colorWithWhite:0.17 alpha:1]);
-        p = tw26_dyn([UIColor colorWithWhite:0.86 alpha:1], [UIColor colorWithWhite:0.32 alpha:1]);
-    });
-    return pressed ? p : n;
-}
-
-static void tw26_styleKeypadButton(UIView *b) {
-    if (!kStyleKeypad) return;
-    CGSize z = b.bounds.size;
-    CGFloat m = MIN(z.width, z.height);
-    if (m < 40) return;
-    CGFloat d = MIN(kKeyD, m);
-
-    UIView *c = [b viewWithTag:kKeyCircleTag];
-    if (!c) {
-        c = [UIView new];
-        c.tag = kKeyCircleTag;
-        c.userInteractionEnabled = NO;
-        c.layer.shadowColor = [UIColor blackColor].CGColor;
-        c.layer.shadowOpacity = 0.10;
-        c.layer.shadowRadius = 14;
-        c.layer.shadowOffset = CGSizeMake(0, 6);
-        [b insertSubview:c atIndex:0];
-    }
-    CGRect cf = CGRectMake((z.width - d) / 2.0, (z.height - d) / 2.0, d, d);
-    if (!CGRectEqualToRect(c.frame, cf)) {
-        c.frame = cf;
-        c.layer.cornerRadius = d / 2.0;
-        c.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:c.bounds].CGPath;
-    }
-    BOOL pressed = [b isKindOfClass:UIControl.class] && ((UIControl *)b).isHighlighted;
-    UIColor *f = tw26_keyFill(pressed);
-    if (![c.backgroundColor isEqual:f]) c.backgroundColor = f;
-
-    // ẩn vòng tròn xám gốc (view hoặc layer lớn), giữ lại số và chữ
-    if (b.backgroundColor && ![b.backgroundColor isEqual:[UIColor clearColor]]) b.backgroundColor = [UIColor clearColor];
-    for (UIView *s2 in b.subviews) {
-        if (s2 == c || [s2 isKindOfClass:UILabel.class]) continue;
-        if (s2.bounds.size.width >= 55 && !s2.hidden) s2.hidden = YES;
-    }
-    for (CALayer *l in b.layer.sublayers) {
-        if (l == c.layer) continue;
-        if (l.bounds.size.width >= 55 && !l.hidden) l.hidden = YES;
-    }
-}
-
-%hook UIView
-- (void)layoutSubviews {
-    %orig;
-    if (tw26_kind(object_getClass(self)) == 1) tw26_styleKeypadButton(self);
-}
-%end
-
-%hook UIControl
-- (void)setHighlighted:(BOOL)h {
-    %orig;
-    if (kStyleKeypad && tw26_kind(object_getClass(self)) == 1) {
-        UIView *c = [self viewWithTag:kKeyCircleTag];
-        if (c) c.backgroundColor = tw26_keyFill(h);
     }
 }
 %end
