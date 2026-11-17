@@ -164,6 +164,7 @@ static void tw26_setAvatar(UIView *av, NSString *name, NSInteger maxLetters) {
 #pragma mark - Tab bar
 
 static CGRect tw26_barFrame(UITabBar *bar, CGRect orig) {
+    if (tw26_classic()) return orig;   // Cổ điển: giữ thanh tab mặc định
     UIView *sv = bar.superview;
     if (!sv || sv.bounds.size.width < 1) return orig;
     CGRect b = sv.bounds;
@@ -180,20 +181,51 @@ static void tw26_applyItemColors(UITabBarItemAppearance *it) {
     it.selected.titleTextAttributes = @{NSForegroundColorAttributeName: s};
 }
 
+static UITabBarAppearance *tw26_customAppearance(void) {
+    UITabBarAppearance *ap = [UITabBarAppearance new];
+    [ap configureWithTransparentBackground];
+    tw26_applyItemColors(ap.stackedLayoutAppearance);
+    tw26_applyItemColors(ap.inlineLayoutAppearance);
+    tw26_applyItemColors(ap.compactInlineLayoutAppearance);
+    return ap;
+}
+
+static char kBarModeKey;
+
 static void tw26_style(UITabBar *bar, BOOL animated) {
     CGRect bounds = bar.bounds;
     if (bounds.size.width < 1) return;
 
-    UIVisualEffectView *ev = (UIVisualEffectView *)[bar viewWithTag:kEffectTag];
-    if (!ev) {
-        UITabBarAppearance *ap = [UITabBarAppearance new];
-        [ap configureWithTransparentBackground];
-        tw26_applyItemColors(ap.stackedLayoutAppearance);
-        tw26_applyItemColors(ap.inlineLayoutAppearance);
-        tw26_applyItemColors(ap.compactInlineLayoutAppearance);
+    NSInteger want = tw26_classic() ? 2 : 1;
+    NSInteger have = [objc_getAssociatedObject(bar, &kBarModeKey) integerValue];
+    UIView *ev0 = [bar viewWithTag:kEffectTag];
+    UIView *cap0 = [bar viewWithTag:kCapsuleTag];
+
+    if (want == 2) {                       // Cổ điển: trả về thanh tab mặc định của iPhone
+        if (have != 2) {
+            objc_setAssociatedObject(bar, &kBarModeKey, @2, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            UITabBarAppearance *d = [UITabBarAppearance new];
+            [d configureWithDefaultBackground];
+            bar.standardAppearance = d;
+            bar.scrollEdgeAppearance = d;
+            ev0.hidden = YES;
+            cap0.hidden = YES;
+            bar.layer.shadowOpacity = 0;
+        }
+        return;
+    }
+    if (have != 1) {                       // Hợp nhất: thanh nổi kiểu iOS 26
+        objc_setAssociatedObject(bar, &kBarModeKey, @1, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UITabBarAppearance *ap = tw26_customAppearance();
         bar.standardAppearance = ap;
         bar.scrollEdgeAppearance = ap;
+        ev0.hidden = NO;
+        cap0.hidden = NO;
+        bar.layer.shadowOpacity = 0.12;
+    }
 
+    UIVisualEffectView *ev = (UIVisualEffectView *)ev0;
+    if (!ev) {
         ev = [[UIVisualEffectView alloc] initWithEffect:
               [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemThinMaterial]];
         ev.tag = kEffectTag;
@@ -592,11 +624,13 @@ static void tw26_showMenu(UIView *anchor, UIViewController *vc, TW26State *st) {
         [ct addSubview:radio];
 
         [ct addSubview:tw26_rowButton(CGRectMake(colW * i, 0, colW, secH), ^{
-            dismiss();
             UIViewController *v = wvc;
             if (v && isClassicOpt != tw26_classic()) {
+                [wo removeFromSuperview];      // bỏ menu ngay để ảnh chụp chuyển cảnh không dính menu
                 [[NSUserDefaults standardUserDefaults] setInteger:(isClassicOpt ? 1 : 0) forKey:kLayoutKey];
                 tw26_applyMode(v);
+            } else {
+                dismiss();
             }
         })];
     }
@@ -755,6 +789,9 @@ static void tw26_applyNav(UIViewController *vc) {
 
 // Chuyển Hợp nhất <-> Cổ điển
 static void tw26_applyMode(UIViewController *vc) {
+    UIWindow *win = vc.view.window;
+    UIView *snap = win ? [win snapshotViewAfterScreenUpdates:NO] : nil;   // ảnh chụp trước khi đổi -> làm mờ dần
+    if (snap) { snap.userInteractionEnabled = NO; [win addSubview:snap]; }
     UITabBarController *tbc = vc.tabBarController;
     NSArray *all = tbc ? objc_getAssociatedObject(tbc, &kAllKey) : nil;
     if (tbc && all.count) {
@@ -764,11 +801,19 @@ static void tw26_applyMode(UIViewController *vc) {
         if (sel && [target containsObject:sel]) tbc.selectedViewController = sel;
         [tbc.tabBar setNeedsLayout];
         [tbc.view setNeedsLayout];
+        [tbc.view layoutIfNeeded];
     }
     tw26_applyNav(vc);
     UITableView *tv = tw26_findTable(vc.view);
     tw26_ensureHeader(tv);
     [tv reloadData];
+    if (snap) {
+        [win layoutIfNeeded];
+        [UIView animateWithDuration:0.5 delay:0.1 options:UIViewAnimationOptionCurveEaseInOut animations:^{
+            snap.alpha = 0;
+            snap.transform = CGAffineTransformMakeScale(1.04, 1.04);
+        } completion:^(BOOL f) { [snap removeFromSuperview]; }];
+    }
 }
 
 // App gốc hay đặt lại nút "Edit" sau khi tweak đã đổi -> chặn lại, ghi nhớ nút gốc, áp dụng lại bố cục của tweak
@@ -996,15 +1041,20 @@ static void tw26_cell(UITableViewCell *cell) {
 
 #pragma mark - Danh bạ (avatar trước tên) & chi tiết liên hệ
 
-static BOOL tw26_isContactListCell(UITableViewCell *c) {
-    const char *n = class_getName(object_getClass(c));
-    return strstr(n, "Contact") && strstr(n, "Cell") && !strstr(n, "Property") && !strstr(n, "Action") &&
-           !strstr(n, "Group") && !strstr(n, "Header") && !strstr(n, "Recents");
+static BOOL tw26_hasNativeAvatar(UIView *v) {
+    for (UIView *s2 in v.subviews) {
+        if (strstr(class_getName(object_getClass(s2)), "Avatar")) return YES;
+        if ([s2 isKindOfClass:UIImageView.class] && !s2.hidden && s2.bounds.size.width >= 36) return YES;
+        if (tw26_hasNativeAvatar(s2)) return YES;
+    }
+    return NO;
 }
 
 static void tw26_contactCell(UITableViewCell *cell) {
     CGFloat W = cell.bounds.size.width, H = cell.bounds.size.height;
     if (W < 1 || H < 1) return;
+    UIView *av = [cell viewWithTag:kAvTag];
+    if (tw26_hasNativeAvatar(cell.contentView)) { av.hidden = YES; return; }   // dòng đã có avatar gốc (Thẻ của tôi)
     NSMutableArray *ls = [NSMutableArray array];
     tw26_collectLabels(cell.contentView, ls);
     UILabel *name = nil; CGRect nr = CGRectZero;
@@ -1015,7 +1065,6 @@ static void tw26_contactCell(UITableViewCell *cell) {
             name = l; nr = r;
         }
     }
-    UIView *av = [cell viewWithTag:kAvTag];
     if (!name) { av.hidden = YES; return; }
     const CGFloat d = 40, avL = 18, gap = 10;
     if (!av) { av = tw26_makeAvatar(d); [cell addSubview:av]; }
@@ -1028,16 +1077,49 @@ static void tw26_contactCell(UITableViewCell *cell) {
         cell.contentView.frame = cf;
         [cell.contentView layoutIfNeeded];
     }
-    cell.separatorInset = UIEdgeInsetsMake(0, avL + d + gap, 0, 0);
+    UIEdgeInsets si = UIEdgeInsetsMake(0, avL + d + gap, 0, 0);
+    if (!UIEdgeInsetsEqualToEdgeInsets(cell.separatorInset, si)) cell.separatorInset = si;
     tw26_setAvatar(av, name.text, 2);
 }
 
+// ---- chi tiết liên hệ: mọi thao tác đều có kiểm tra "đã đúng thì thôi" để không gây vòng lặp layout (treo máy)
 static UIColor *tw26_detailBg(void) {
-    return tw26_dyn([UIColor colorWithRed:0.58 green:0.60 blue:0.66 alpha:1],
-                    [UIColor colorWithRed:0.20 green:0.21 blue:0.25 alpha:1]);
+    static UIColor *c; static dispatch_once_t o;
+    dispatch_once(&o, ^{ c = tw26_dyn([UIColor colorWithRed:0.58 green:0.60 blue:0.66 alpha:1],
+                                      [UIColor colorWithRed:0.20 green:0.21 blue:0.25 alpha:1]); });
+    return c;
 }
 static UIColor *tw26_detailCard(void) {
-    return tw26_dyn([UIColor colorWithWhite:0 alpha:0.13], [UIColor colorWithWhite:1 alpha:0.08]);
+    static UIColor *c; static dispatch_once_t o;
+    dispatch_once(&o, ^{ c = tw26_dyn([UIColor colorWithWhite:0 alpha:0.13], [UIColor colorWithWhite:1 alpha:0.08]); });
+    return c;
+}
+static UIColor *tw26_detailSep(void) {
+    static UIColor *c; static dispatch_once_t o;
+    dispatch_once(&o, ^{ c = [UIColor colorWithWhite:1 alpha:0.25]; });
+    return c;
+}
+static UIColor *tw26_txtBig(void) {
+    static UIColor *c; static dispatch_once_t o;
+    dispatch_once(&o, ^{ c = [UIColor colorWithWhite:1 alpha:0.96]; });
+    return c;
+}
+static UIColor *tw26_txtSmall(void) {
+    static UIColor *c; static dispatch_once_t o;
+    dispatch_once(&o, ^{ c = [UIColor colorWithWhite:1 alpha:0.72]; });
+    return c;
+}
+static UIColor *tw26_pillBg(void) {
+    static UIColor *c; static dispatch_once_t o;
+    dispatch_once(&o, ^{ c = [UIColor colorWithWhite:0 alpha:0.12]; });
+    return c;
+}
+
+static void tw26_setBg(UIView *v, UIColor *c) {
+    if (v && ![v.backgroundColor isEqual:c]) v.backgroundColor = c;
+}
+static void tw26_setTxt(UILabel *l, UIColor *c) {
+    if (![l.textColor isEqual:c]) l.textColor = c;
 }
 
 static BOOL tw26_isDetailVC(UIViewController *vc) {
@@ -1046,19 +1128,21 @@ static BOOL tw26_isDetailVC(UIViewController *vc) {
     return strstr(n, "CNContact") && !strstr(n, "List") && !strstr(n, "Picker") && !strstr(n, "Group");
 }
 
-static char kSegKey;
+static char kSegKey, kThrottleKey, kPendingKey;
 
 static void tw26_collectControls(UIView *v, NSMutableArray *out) {
-    for (UIView *s in v.subviews) {
-        if ([s isKindOfClass:UIControl.class] && ![s isKindOfClass:UISegmentedControl.class]) [out addObject:s];
-        else tw26_collectControls(s, out);
+    for (UIView *s2 in v.subviews) {
+        if ([s2 isKindOfClass:UIControl.class] && ![s2 isKindOfClass:UISegmentedControl.class]) [out addObject:s2];
+        else tw26_collectControls(s2, out);
     }
 }
 
-// Nút hành động (nhắn tin / gọi / video / mail) -> dạng viên tròn mờ, chỉ còn icon
+// Nút hành động (nhắn tin / gọi / video / mail) -> viên tròn mờ, chỉ còn icon
 static void tw26_styleDetailHeader(UITableView *tv) {
     UIView *h = tv.tableHeaderView;
     if (!h) return;
+    NSMutableArray *hl = [NSMutableArray array];
+    tw26_collectLabels(h, hl);
     NSMutableArray *cs = [NSMutableArray array];
     tw26_collectControls(h, cs);
     for (UIControl *c in cs) {
@@ -1066,42 +1150,65 @@ static void tw26_styleDetailHeader(UITableView *tv) {
         if (z.width < 50 || z.width > 140 || z.height < 40 || z.height > 100) continue;
         const char *cn = class_getName(object_getClass(c));
         if (!strcasestr(cn, "Action") && !strcasestr(cn, "Button")) continue;
-        c.backgroundColor = [UIColor colorWithWhite:0 alpha:0.12];
-        c.layer.cornerRadius = z.height / 2.0;
-        c.clipsToBounds = YES;
-        c.tintColor = [UIColor whiteColor];
+        tw26_setBg(c, tw26_pillBg());
+        if (fabs(c.layer.cornerRadius - z.height / 2.0) > 0.5) c.layer.cornerRadius = z.height / 2.0;
+        if (!c.clipsToBounds) c.clipsToBounds = YES;
         NSMutableArray *ls = [NSMutableArray array];
         tw26_collectLabels(c, ls);
-        for (UILabel *l in ls) l.hidden = YES;
+        for (UILabel *l in ls) { if (!l.hidden) l.hidden = YES; [hl removeObject:l]; }
     }
+    for (UILabel *l in hl) tw26_setTxt(l, [UIColor whiteColor]);
 }
 
-static void tw26_detailCell(UITableViewCell *cell) {
+static void tw26_styleDetailTable(UITableView *tv) {
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    NSNumber *last = objc_getAssociatedObject(tv, &kThrottleKey);
+    if (last && now - last.doubleValue < 0.3) {
+        if (![objc_getAssociatedObject(tv, &kPendingKey) boolValue]) {     // đảm bảo có một lần áp dụng cuối
+            objc_setAssociatedObject(tv, &kPendingKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            __weak UITableView *wtv = tv;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                UITableView *t2 = wtv;
+                if (!t2) return;
+                objc_setAssociatedObject(t2, &kPendingKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                tw26_styleDetailTable(t2);
+            });
+        }
+        return;
+    }
+    objc_setAssociatedObject(tv, &kThrottleKey, @(now), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    tw26_setBg(tv, tw26_detailBg());
+    if (tv.superview) tw26_setBg(tv.superview, tw26_detailBg());
+    if (![tv.separatorColor isEqual:tw26_detailSep()]) tv.separatorColor = tw26_detailSep();
+    tw26_styleDetailHeader(tv);
+}
+
+static void tw26_detailCell(UITableViewCell *cell, UITableView *tv) {
+    tw26_setBg(cell, tw26_detailCard());
+    if (![cell.tintColor isEqual:[UIColor whiteColor]]) cell.tintColor = [UIColor whiteColor];
+    NSMutableArray *ls = [NSMutableArray array];
+    tw26_collectLabels(cell.contentView, ls);
+    for (UILabel *l in ls) tw26_setTxt(l, l.font.pointSize >= 16.5 ? tw26_txtBig() : tw26_txtSmall());
+    tw26_styleDetailTable(tv);
+}
+
+// Phân loại bảng theo màn hình chứa nó: 1 = chi tiết liên hệ, 3 = danh sách danh bạ, 2 = khác
+static void tw26_otherCell(UITableViewCell *cell) {
     UITableView *tv = tw26_tableOf(cell);
     if (!tv) return;
     NSNumber *k = objc_getAssociatedObject(tv, &kDetailKey);
     if (!k) {
-        k = @(tw26_isDetailVC(tw26_vcOf(tv)) ? 1 : 2);
+        UIViewController *vc = tw26_vcOf(tv);
+        if (!vc) return;                       // chưa gắn vào màn hình -> thử lại lần sau
+        const char *n = class_getName(object_getClass(vc));
+        int kind = 2;
+        if (tw26_isDetailVC(vc)) kind = 1;
+        else if (strstr(n, "Contact") && !strstr(n, "Picker") && !strstr(n, "Group")) kind = 3;
+        k = @(kind);
         objc_setAssociatedObject(tv, &kDetailKey, k, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
-    if (k.integerValue != 1) return;
-    tv.backgroundColor = tw26_detailBg();
-    tv.superview.backgroundColor = tw26_detailBg();
-    tv.separatorColor = [UIColor colorWithWhite:1 alpha:0.25];
-    cell.backgroundColor = tw26_detailCard();
-    cell.tintColor = [UIColor whiteColor];
-    NSMutableArray *ls = [NSMutableArray array];
-    tw26_collectLabels(cell.contentView, ls);
-    for (UILabel *l in ls) {
-        BOOL big = l.font.pointSize >= 16.5;
-        l.textColor = [UIColor colorWithWhite:1 alpha:(big ? 0.96 : 0.72)];
-    }
-    if (tv.tableHeaderView) {
-        NSMutableArray *hl = [NSMutableArray array];
-        tw26_collectLabels(tv.tableHeaderView, hl);
-        for (UILabel *l in hl) l.textColor = [UIColor whiteColor];
-    }
-    tw26_styleDetailHeader(tv);
+    if (k.integerValue == 1) tw26_detailCell(cell, tv);
+    else if (k.integerValue == 3) tw26_contactCell(cell);
 }
 
 %hook UISegmentedControl
@@ -1116,7 +1223,7 @@ static void tw26_detailCell(UITableViewCell *cell) {
         [self setTitleTextAttributes:a forState:UIControlStateSelected];
         self.selectedSegmentTintColor = [UIColor colorWithWhite:1 alpha:0.35];
     }
-    self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.10];
+    tw26_setBg(self, tw26_pillBg());
 }
 %end
 
@@ -1124,8 +1231,7 @@ static void tw26_detailCell(UITableViewCell *cell) {
 - (void)layoutSubviews {
     %orig;
     if (tw26_isRecentsCell(self)) tw26_cell(self);
-    else if (tw26_isContactListCell(self)) tw26_contactCell(self);
-    else tw26_detailCell(self);
+    else tw26_otherCell(self);
 }
 
 %new
@@ -1166,25 +1272,56 @@ static int tw26_kind(Class c) {
     return k;
 }
 
-static const BOOL kHideKeypadBg = YES;   // NO nếu sau khi cài số trên phím biến mất
+static const BOOL kStyleKeypad = YES;      // NO = trả bàn phím về mặc định của iPhone
+static const CGFloat kKeyD = 78.0;           // đường kính vòng tròn phím
+static const NSInteger kKeyCircleTag = 26040;
+
+static UIColor *tw26_keyFill(BOOL pressed) {
+    static UIColor *n, *p; static dispatch_once_t o;
+    dispatch_once(&o, ^{
+        n = tw26_dyn([UIColor colorWithWhite:0.985 alpha:1], [UIColor colorWithWhite:0.17 alpha:1]);
+        p = tw26_dyn([UIColor colorWithWhite:0.86 alpha:1], [UIColor colorWithWhite:0.32 alpha:1]);
+    });
+    return pressed ? p : n;
+}
 
 static void tw26_styleKeypadButton(UIView *b) {
+    if (!kStyleKeypad) return;
     CGSize z = b.bounds.size;
-    CGFloat d = MIN(z.width, z.height);
-    if (d < 40) return;
-    b.backgroundColor = tw26_dyn([UIColor colorWithWhite:0.985 alpha:1], [UIColor colorWithWhite:0.17 alpha:1]);
-    b.layer.cornerRadius = d / 2.0;
-    b.layer.masksToBounds = NO;
-    b.layer.shadowColor = [UIColor blackColor].CGColor;
-    b.layer.shadowOpacity = 0.10;
-    b.layer.shadowRadius = 14;
-    b.layer.shadowOffset = CGSizeMake(0, 6);
-    b.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:
-                          CGRectMake((z.width - d) / 2.0, (z.height - d) / 2.0, d, d)].CGPath;
-    if (!kHideKeypadBg) return;
-    for (UIView *s in b.subviews) {
-        if ([s isKindOfClass:UILabel.class]) continue;
-        if (s.bounds.size.width >= d * 0.85 && s.bounds.size.height >= d * 0.85) s.hidden = YES;
+    CGFloat m = MIN(z.width, z.height);
+    if (m < 40) return;
+    CGFloat d = MIN(kKeyD, m);
+
+    UIView *c = [b viewWithTag:kKeyCircleTag];
+    if (!c) {
+        c = [UIView new];
+        c.tag = kKeyCircleTag;
+        c.userInteractionEnabled = NO;
+        c.layer.shadowColor = [UIColor blackColor].CGColor;
+        c.layer.shadowOpacity = 0.10;
+        c.layer.shadowRadius = 14;
+        c.layer.shadowOffset = CGSizeMake(0, 6);
+        [b insertSubview:c atIndex:0];
+    }
+    CGRect cf = CGRectMake((z.width - d) / 2.0, (z.height - d) / 2.0, d, d);
+    if (!CGRectEqualToRect(c.frame, cf)) {
+        c.frame = cf;
+        c.layer.cornerRadius = d / 2.0;
+        c.layer.shadowPath = [UIBezierPath bezierPathWithOvalInRect:c.bounds].CGPath;
+    }
+    BOOL pressed = [b isKindOfClass:UIControl.class] && ((UIControl *)b).isHighlighted;
+    UIColor *f = tw26_keyFill(pressed);
+    if (![c.backgroundColor isEqual:f]) c.backgroundColor = f;
+
+    // ẩn vòng tròn xám gốc (view hoặc layer lớn), giữ lại số và chữ
+    if (b.backgroundColor && ![b.backgroundColor isEqual:[UIColor clearColor]]) b.backgroundColor = [UIColor clearColor];
+    for (UIView *s2 in b.subviews) {
+        if (s2 == c || [s2 isKindOfClass:UILabel.class]) continue;
+        if (s2.bounds.size.width >= 55 && !s2.hidden) s2.hidden = YES;
+    }
+    for (CALayer *l in b.layer.sublayers) {
+        if (l == c.layer) continue;
+        if (l.bounds.size.width >= 55 && !l.hidden) l.hidden = YES;
     }
 }
 
@@ -1195,7 +1332,28 @@ static void tw26_styleKeypadButton(UIView *b) {
 }
 %end
 
+%hook UIControl
+- (void)setHighlighted:(BOOL)h {
+    %orig;
+    if (kStyleKeypad && tw26_kind(object_getClass(self)) == 1) {
+        UIView *c = [self viewWithTag:kKeyCircleTag];
+        if (c) c.backgroundColor = tw26_keyFill(h);
+    }
+}
+%end
+
 #pragma mark - Ô tìm kiếm bo tròn có bóng (Danh bạ...)
+
+static void tw26_hideSearchBg(UIView *v) {
+    for (UIView *s2 in v.subviews) {
+        const char *n = class_getName(object_getClass(s2));
+        if (strstr(n, "SearchFieldBackground") || strstr(n, "SearchBarBackground")) {
+            if (s2.alpha != 0) s2.alpha = 0;
+        } else {
+            tw26_hideSearchBg(s2);
+        }
+    }
+}
 
 %hook UISearchBar
 - (void)layoutSubviews {
@@ -1203,8 +1361,10 @@ static void tw26_styleKeypadButton(UIView *b) {
     UITextField *tf = self.searchTextField;
     if (!tf || tf.bounds.size.height < 20) return;
     if (self.searchBarStyle != UISearchBarStyleMinimal) self.searchBarStyle = UISearchBarStyleMinimal;
+    tw26_hideSearchBg(self);
     CGFloat h = tf.bounds.size.height;
-    tf.backgroundColor = tw26_dyn([UIColor whiteColor], [UIColor colorWithWhite:0.17 alpha:1]);
+    UIColor *bg = tw26_dyn([UIColor whiteColor], [UIColor colorWithWhite:0.17 alpha:1]);
+    tw26_setBg(tf, bg);
     tf.layer.cornerRadius = h / 2.0;
     tf.layer.masksToBounds = NO;
     tf.layer.shadowColor = [UIColor blackColor].CGColor;
@@ -1239,10 +1399,12 @@ static UIImage *tw26_pillImage(void) {
     return [rs imageWithAlignmentRectInsets:UIEdgeInsetsMake(-8, -12, -8, -12)];
 }
 
+static const BOOL kPillBarButtons = NO;   // YES = bo viên thuốc các nút thanh tiêu đề gốc (có thể bị viền đôi)
+
 %ctor {
     %init;
     tw26_dumpInstall();
-    @autoreleasepool {
+    if (kPillBarButtons) @autoreleasepool {
         UIImage *img = tw26_pillImage();
         UIBarButtonItem *a = [UIBarButtonItem appearance];
         [a setBackgroundImage:img forState:UIControlStateNormal barMetrics:UIBarMetricsDefault];
