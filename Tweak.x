@@ -1087,8 +1087,10 @@ static void tw26_cell(UITableViewCell *cell) {
 
 static BOOL tw26_hasNativeAvatar(UIView *v) {
     for (UIView *s2 in v.subviews) {
-        if (strstr(class_getName(object_getClass(s2)), "Avatar")) return YES;
-        if ([s2 isKindOfClass:UIImageView.class] && !s2.hidden && s2.bounds.size.width >= 36) return YES;
+        if (s2.hidden || s2.alpha < 0.05) continue;
+        CGFloat w = s2.bounds.size.width;
+        if (w >= 30 && strstr(class_getName(object_getClass(s2)), "Avatar")) return YES;
+        if ([s2 isKindOfClass:UIImageView.class] && w >= 36) return YES;
         if (tw26_hasNativeAvatar(s2)) return YES;
     }
     return NO;
@@ -1449,7 +1451,7 @@ static UIView *tw26_buildBigHeader(CGFloat W, NSString *initials, UIImage *photo
 }
 
 // Bảng được phóng kín màn hình, header nằm trong bảng; contentInset đẩy các thẻ xuống dưới header
-static char kSavedKey;
+static char kSavedKey, kInstallTimeKey, kUserScrollKey;
 
 static void tw26_enforceDetailLayout(UIViewController *root, UITableView *tv) {
     UIView *base = root.view;
@@ -1482,6 +1484,16 @@ static void tw26_enforceDetailLayout(UIViewController *root, UITableView *tv) {
         objc_setAssociatedObject(tv, &kBigInsetKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         tv.contentOffset = CGPointMake(0, -topInset);                      // về đầu trang
     }
+    // iPhone có thể tự cuộn bảng sau khi mở màn hình -> trong ~1.4s đầu luôn kéo về đầu trang (trừ khi bạn đã tự cuộn)
+    NSNumber *t0 = objc_getAssociatedObject(tv, &kInstallTimeKey);
+    if (t0 && CFAbsoluteTimeGetCurrent() - t0.doubleValue < 1.4 &&
+        ![objc_getAssociatedObject(tv, &kUserScrollKey) boolValue]) {
+        if (tv.isTracking || tv.isDragging || tv.isDecelerating) {
+            objc_setAssociatedObject(tv, &kUserScrollKey, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        } else if (fabs(tv.contentOffset.y + topInset) > 1.0) {
+            tv.contentOffset = CGPointMake(0, -topInset);
+        }
+    }
     CGRect hf = CGRectMake(0, -(Hh + 12), tv.bounds.size.width, Hh);
     if (!CGRectEqualToRect(header.frame, hf)) header.frame = hf;
 }
@@ -1494,7 +1506,18 @@ static void tw26_installBigHeader(UIViewController *root, UITableView *tv, UIVie
     [tv addSubview:header];
     objc_setAssociatedObject(tv, &kBigHdrKey, header, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     objc_setAssociatedObject(tv, &kBigInsetKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(tv, &kInstallTimeKey, @(CFAbsoluteTimeGetCurrent()), OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    objc_setAssociatedObject(tv, &kUserScrollKey, @NO, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (![tv.backgroundColor isEqual:tw26_detailBg()]) tv.backgroundColor = tw26_detailBg();   // bảng đục: che phần đầu trang gốc phía sau
     tw26_enforceDetailLayout(root, tv);
+    __weak UIViewController *wroot = root;
+    __weak UITableView *wtv = tv;
+    for (NSNumber *d in @[@0.05, @0.2, @0.45, @0.8, @1.3]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UIViewController *r = wroot; UITableView *t = wtv;
+            if (r && t) tw26_enforceDetailLayout(r, t);
+        });
+    }
 }
 
 static void tw26_removeBigHeader(UIViewController *root, UITableView *tv) {
@@ -1593,14 +1616,6 @@ static void tw26_styleDetailRoot(UIViewController *root) {
             BOOL fromRecents = tbc && [tw26_name(tbc.selectedViewController) containsString:@"recent"];
             UIView *h = tw26_buildBigHeader(tv.bounds.size.width, initials, photo, nameL.text, natives, fromRecents, root, tv);
 
-            NSMutableArray *hide = [NSMutableArray array];       // ẩn phần đầu trang gốc (vẫn dùng để chuyển lệnh bấm)
-            [hide addObjectsFromArray:labels];
-            [hide addObjectsFromArray:controls];
-            if (avNative) [hide addObject:avNative];
-            for (UIView *v in hide) { v.alpha = 0; v.userInteractionEnabled = NO; }
-            for (UIView *c in containers) if (![tv isDescendantOfView:c]) c.userInteractionEnabled = NO;
-            objc_setAssociatedObject(tv, &kHiddenKey, hide, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-
             tw26_installBigHeader(root, tv, h);
             existing = h;
         }
@@ -1631,7 +1646,10 @@ static void tw26_detailCell(UITableViewCell *cell, UITableView *tv) {
     if (![cell.tintColor isEqual:[UIColor whiteColor]]) cell.tintColor = [UIColor whiteColor];
     NSMutableArray *ls = [NSMutableArray array];
     tw26_collectLabels(cell.contentView, ls);
-    for (UILabel *l in ls) tw26_setTxt(l, l.font.pointSize >= 16.5 ? tw26_txtBig() : tw26_txtSmall());
+    for (UILabel *l in ls) {
+        if (l.alpha < 1) l.alpha = 1;
+        tw26_setTxt(l, l.font.pointSize >= 16.5 ? tw26_txtBig() : tw26_txtSmall());
+    }
 
     // mỗi nhóm dòng = một thẻ bo tròn lớn (góc trên cho dòng đầu, góc dưới cho dòng cuối)
     NSIndexPath *ip = [tv indexPathForCell:cell];
@@ -1666,7 +1684,7 @@ static int tw26_tableKind(UITableView *tv) {
         vcCount++;
         const char *n = class_getName(object_getClass(r));
         if (tw26_isDetailVC((UIViewController *)r)) detail = YES;
-        if (strstr(n, "Group") || strstr(n, "Picker")) excluded = YES;
+        if (vcCount == 1 && (strstr(n, "Group") || strstr(n, "Picker"))) excluded = YES;   // chỉ xét màn hình gần bảng nhất
         if (strstr(n, "Contact")) contactName = YES;
     }
     if (vcCount == 0) return 0;
